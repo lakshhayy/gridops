@@ -1,0 +1,61 @@
+version: '3.8'
+
+# GridOps Infrastructure Definition
+# Defines the interaction between the core API, the optimization engine, and persistence layers.
+
+services:
+  # Core Node.js API Gateway & Business Logic
+  api:
+    build: 
+      context: ./server
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - NODE_ENV=production
+      - PORT=5000
+      - DATABASE_URL=postgresql://gridops:securepass@db:5432/gridops_prod
+      - OPTIMIZER_URL=http://optimizer:8000
+    depends_on:
+      - db
+      - optimizer
+    networks:
+      - grid_net
+    restart: unless-stopped
+
+  # Python-based Thermal Analytics Microservice
+  optimizer:
+    build: 
+      context: ./optimizer
+    ports:
+      - "8000:8000"
+    environment:
+      - WORKERS=4
+      - LOG_LEVEL=info
+    networks:
+      - grid_net
+    restart: on-failure
+
+  # Persistence Layer
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: gridops
+      POSTGRES_PASSWORD: securepass
+      POSTGRES_DB: gridops_prod
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - grid_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gridops"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
+
+networks:
+  grid_net:
+    driver: bridge

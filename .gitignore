@@ -1,0 +1,16 @@
+# Dependencies
+node_modules
+.venv
+__pycache__
+
+# Build outputs
+dist
+build
+
+# Environment
+.env
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
