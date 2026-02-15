@@ -1,0 +1,146 @@
+diff --git a/optimizer/main.py b/optimizer/main.py
+index 20308b3..0a9b177 100644
+--- a/optimizer/main.py
++++ b/optimizer/main.py
+@@ -23,6 +23,8 @@ class SimulationRequest(BaseModel):
+     ac_setpoint: float = Field(..., ge=16.0, le=32.0, description="Target HVAC temperature in Celsius")
+     reduction_factor: float = Field(..., ge=0.0, le=1.0, description="Load shedding percentage (0-1)")
+     enable_incentives: bool = Field(default=False, description="Apply DISCOM demand response rebates")
++    # New field for Task 2
++    grid_carbon_intensity: float = Field(default=0.82, ge=0.0, le=2.0, description="Current grid carbon intensity in kgCO2/kWh")
+ 
+ class SimulationResponse(BaseModel):
+     projected_kwh: float
+@@ -32,10 +34,8 @@ class SimulationResponse(BaseModel):
+     grid_stability_score: float
+ 
+ # --- Physics Constants (Delhi NCR Region) ---
+-# Baseline assumes a 50,000 sqft commercial facility
+ BASE_LOAD_KWH = 28500.0  
+ THERMAL_COEFF = 0.085    # ~8.5% energy delta per degree C (ASHRAE approximation)
+-CARBON_INTENSITY = 0.82  # kgCO2/kWh (Grid India average)
+ PEAK_TARIFF = 12.50      # INR/kWh
+ OFF_PEAK_TARIFF = 8.50   # INR/kWh
+ 
+@@ -49,50 +49,52 @@ async def calculate_impact(payload: SimulationRequest):
+     try:
+         logger.info(f"Processing simulation for setpoint: {payload.ac_setpoint}C")
+ 
+-        # 1. Thermal Load Calculation
+-        # Using simplified Degree-Day method. Baseline assumed at 22C.
+-        # Physics: Q = U * A * Delta T
+-        delta_t = max(0, payload.ac_setpoint - 22.0)
++        # 1. Carbon-Aware Load Shedding Logic (Task 2)
++        # If the grid is dirty (>0.90 kgCO2/kWh), enforce at least 20% shedding
++        effective_reduction = payload.reduction_factor
+         
+-        # Non-linear savings curve (diminishing returns > 26C)
+-        # Using numpy for efficient calculation
++        if payload.grid_carbon_intensity > 0.90:
++            if effective_reduction < 0.20:
++                logger.info("High carbon intensity detected. Enforcing minimum 20% load shedding.")
++                effective_reduction = 0.20
++
++        # 2. Thermal Load Calculation
++        delta_t = max(0, payload.ac_setpoint - 22.0)
+         thermal_savings_pct = np.tanh(delta_t * THERMAL_COEFF)
+         
+-        # 2. Load Shedding Impact
+-        shedding_savings = BASE_LOAD_KWH * payload.reduction_factor
++        # 3. Calculate Savings
++        # Use effective_reduction (which might be higher than requested)
++        shedding_savings = BASE_LOAD_KWH * effective_reduction
+         thermal_savings = BASE_LOAD_KWH * thermal_savings_pct
+         
+         total_savings_kwh = thermal_savings + shedding_savings
+         final_load = max(0, BASE_LOAD_KWH - total_savings_kwh)
+ 
+-        # 3. Financial Modeling
+-        # Blended rate assumption (60% peak / 40% off-peak)
++        # 4. Financial Modeling
+         blended_rate = (PEAK_TARIFF * 0.6) + (OFF_PEAK_TARIFF * 0.4)
+         base_cost = final_load * blended_rate
+         
+         dr_rebate = 5000.0 if payload.enable_incentives else 0.0
+         final_cost = max(0, base_cost - dr_rebate)
+ 
+-        # 4. Comfort Index Calculation (ASHRAE 55 simplified)
+-        # 1.0 = Perfect, 0.0 = Uninhabitable
++        # 5. Comfort Index Calculation
+         comfort_penalty = 0.0
+         
+         if payload.ac_setpoint > 24.0:
+-            # Exponential penalty for high temps
+             comfort_penalty += ((payload.ac_setpoint - 24.0) ** 1.5) * 0.08
+             
+-        if payload.reduction_factor > 0.15:
+-            # Linear penalty for aggressive shedding
+-            comfort_penalty += (payload.reduction_factor - 0.15) * 2.5
++        # Use effective_reduction for comfort penalty calculation
++        if effective_reduction > 0.15:
++            comfort_penalty += (effective_reduction - 0.15) * 2.5
+             
+         comfort_score = max(0.1, 1.0 - comfort_penalty)
+ 
+         return {
+             "projected_kwh": round(float(final_load), 2),
+             "cost_estimate": round(float(final_cost), 2),
+-            "carbon_footprint": round(float(final_load * CARBON_INTENSITY), 2),
++            "carbon_footprint": round(float(final_load * payload.grid_carbon_intensity), 2),
+             "comfort_index": round(float(comfort_score), 3),
+-            "grid_stability_score": round(0.85 + (payload.reduction_factor * 0.15), 3)
++            "grid_stability_score": round(0.85 + (effective_reduction * 0.15), 3)
+         }
+ 
+     except Exception as e:
+diff --git a/server/src/routes/simulation.routes.ts b/server/src/routes/simulation.routes.ts
+index 8e71bb9..a752932 100644
+--- a/server/src/routes/simulation.routes.ts
++++ b/server/src/routes/simulation.routes.ts
+@@ -1,6 +1,6 @@
+ import { Router, Request, Response } from 'express';
+ import { optimizerService } from '../services/optimizer.service';
+-import { db } from '../db'; // We will create this next
++import { db } from '../db';
+ import { simulationLogs } from '../db/schema';
+ import { z } from 'zod';
+ 
+@@ -10,7 +10,8 @@ const router = Router();
+ const SimulationSchema = z.object({
+   acTemp: z.number().min(16).max(32),
+   reductionPercent: z.number().min(0).max(100),
+-  incentives: z.boolean().optional()
++  incentives: z.boolean().optional(),
++  carbonIntensity: z.number().optional() // Added for Task 2
+ });
+ 
+ router.post('/run', async (req: Request, res: Response) => {
+@@ -20,7 +21,8 @@ router.post('/run', async (req: Request, res: Response) => {
+     const result = await optimizerService.runSimulation({
+       ac_setpoint: payload.acTemp,
+       reduction_factor: payload.reductionPercent / 100,
+-      enable_incentives: payload.incentives || false
++      enable_incentives: payload.incentives || false,
++      grid_carbon_intensity: payload.carbonIntensity
+     });
+ 
+     // Async logging (fire and forget)
+diff --git a/server/src/services/optimizer.service.ts b/server/src/services/optimizer.service.ts
+index e4a5b50..ea04479 100644
+--- a/server/src/services/optimizer.service.ts
++++ b/server/src/services/optimizer.service.ts
+@@ -5,6 +5,7 @@ interface SimulationParams {
+   ac_setpoint: number;
+   reduction_factor: number;
+   enable_incentives: boolean;
++  grid_carbon_intensity?: number; // Added for Task 2
+ }
+ 
+ interface SimulationResult {
+@@ -41,4 +42,4 @@ export class OptimizerService {
+   }
+ }
+ 
+-export const optimizerService = new OptimizerService();
++export const optimizerService = new OptimizerService();
+\ No newline at end of file
