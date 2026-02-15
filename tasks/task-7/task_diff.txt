@@ -1,0 +1,191 @@
+diff --git a/optimizer/main.py b/optimizer/main.py
+index 20308b3..f78c7e8 100644
+--- a/optimizer/main.py
++++ b/optimizer/main.py
+@@ -4,25 +4,17 @@ from fastapi import FastAPI, HTTPException, status
+ from pydantic import BaseModel, Field
+ import numpy as np
+ 
+-# Configure structured logging for container observability
+-logging.basicConfig(
+-    level=logging.INFO,
+-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+-)
++logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+ logger = logging.getLogger("gridops-optimizer")
+ 
+-app = FastAPI(
+-    title="GridOps Optimization Engine",
+-    version="1.0.0",
+-    docs_url="/docs"
+-)
+-
+-# --- Domain Models ---
++app = FastAPI(title="GridOps Optimization Engine", version="1.0.0", docs_url="/docs")
+ 
+ class SimulationRequest(BaseModel):
+     ac_setpoint: float = Field(..., ge=16.0, le=32.0, description="Target HVAC temperature in Celsius")
+     reduction_factor: float = Field(..., ge=0.0, le=1.0, description="Load shedding percentage (0-1)")
+     enable_incentives: bool = Field(default=False, description="Apply DISCOM demand response rebates")
++    # Task 7: Humidity Field
++    relative_humidity: float = Field(default=60.0, ge=0.0, le=100.0, description="Relative Humidity %")
+ 
+ class SimulationResponse(BaseModel):
+     projected_kwh: float
+@@ -31,60 +23,49 @@ class SimulationResponse(BaseModel):
+     comfort_index: float
+     grid_stability_score: float
+ 
+-# --- Physics Constants (Delhi NCR Region) ---
+-# Baseline assumes a 50,000 sqft commercial facility
+ BASE_LOAD_KWH = 28500.0  
+-THERMAL_COEFF = 0.085    # ~8.5% energy delta per degree C (ASHRAE approximation)
+-CARBON_INTENSITY = 0.82  # kgCO2/kWh (Grid India average)
+-PEAK_TARIFF = 12.50      # INR/kWh
+-OFF_PEAK_TARIFF = 8.50   # INR/kWh
++THERMAL_COEFF = 0.085    
++CARBON_INTENSITY = 0.82  
++PEAK_TARIFF = 12.50      
++OFF_PEAK_TARIFF = 8.50   
+ 
+ @app.get("/health")
+ async def health_check():
+-    """K8s/Docker health probe endpoint."""
+     return {"status": "healthy", "service": "optimizer"}
+ 
+ @app.post("/calculate", response_model=SimulationResponse)
+ async def calculate_impact(payload: SimulationRequest):
+     try:
+-        logger.info(f"Processing simulation for setpoint: {payload.ac_setpoint}C")
++        # Task 7: Humidity adjustment
++        humidity = payload.relative_humidity
++        effective_coeff = THERMAL_COEFF
++        
++        if humidity > 60.0:
++            # Efficiency drops by 1% for every 1% humidity above 60%
++            penalty = (humidity - 60.0) * 0.01
++            effective_coeff = THERMAL_COEFF / (1.0 + penalty)
++            logger.info(f"High humidity ({humidity}%) detected. Coeff adjusted to {effective_coeff}")
+ 
+-        # 1. Thermal Load Calculation
+-        # Using simplified Degree-Day method. Baseline assumed at 22C.
+-        # Physics: Q = U * A * Delta T
+         delta_t = max(0, payload.ac_setpoint - 22.0)
++        thermal_savings_pct = np.tanh(delta_t * effective_coeff) # Uses adjusted coeff
+         
+-        # Non-linear savings curve (diminishing returns > 26C)
+-        # Using numpy for efficient calculation
+-        thermal_savings_pct = np.tanh(delta_t * THERMAL_COEFF)
+-        
+-        # 2. Load Shedding Impact
+         shedding_savings = BASE_LOAD_KWH * payload.reduction_factor
+         thermal_savings = BASE_LOAD_KWH * thermal_savings_pct
+         
+         total_savings_kwh = thermal_savings + shedding_savings
+         final_load = max(0, BASE_LOAD_KWH - total_savings_kwh)
+ 
+-        # 3. Financial Modeling
+-        # Blended rate assumption (60% peak / 40% off-peak)
+         blended_rate = (PEAK_TARIFF * 0.6) + (OFF_PEAK_TARIFF * 0.4)
+         base_cost = final_load * blended_rate
+         
+         dr_rebate = 5000.0 if payload.enable_incentives else 0.0
+         final_cost = max(0, base_cost - dr_rebate)
+ 
+-        # 4. Comfort Index Calculation (ASHRAE 55 simplified)
+-        # 1.0 = Perfect, 0.0 = Uninhabitable
+         comfort_penalty = 0.0
+-        
+         if payload.ac_setpoint > 24.0:
+-            # Exponential penalty for high temps
+             comfort_penalty += ((payload.ac_setpoint - 24.0) ** 1.5) * 0.08
+-            
+         if payload.reduction_factor > 0.15:
+-            # Linear penalty for aggressive shedding
+             comfort_penalty += (payload.reduction_factor - 0.15) * 2.5
+-            
+         comfort_score = max(0.1, 1.0 - comfort_penalty)
+ 
+         return {
+@@ -94,10 +75,6 @@ async def calculate_impact(payload: SimulationRequest):
+             "comfort_index": round(float(comfort_score), 3),
+             "grid_stability_score": round(0.85 + (payload.reduction_factor * 0.15), 3)
+         }
+-
+     except Exception as e:
+         logger.error(f"Calculation failed: {str(e)}", exc_info=True)
+-        raise HTTPException(
+-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+-            detail="Optimization engine computation error"
+-        )
+\ No newline at end of file
++        raise HTTPException(status_code=500, detail="Optimization engine computation error")
+\ No newline at end of file
+diff --git a/server/src/routes/simulation.routes.ts b/server/src/routes/simulation.routes.ts
+index 8e71bb9..a3fb312 100644
+--- a/server/src/routes/simulation.routes.ts
++++ b/server/src/routes/simulation.routes.ts
+@@ -1,16 +1,16 @@
+ import { Router, Request, Response } from 'express';
+ import { optimizerService } from '../services/optimizer.service';
+-import { db } from '../db'; // We will create this next
++import { db } from '../db';
+ import { simulationLogs } from '../db/schema';
+ import { z } from 'zod';
+ 
+ const router = Router();
+ 
+-// Validation schema
+ const SimulationSchema = z.object({
+   acTemp: z.number().min(16).max(32),
+   reductionPercent: z.number().min(0).max(100),
+-  incentives: z.boolean().optional()
++  incentives: z.boolean().optional(),
++  relativeHumidity: z.number().min(0).max(100).optional() // Added for Task 7
+ });
+ 
+ router.post('/run', async (req: Request, res: Response) => {
+@@ -20,10 +20,10 @@ router.post('/run', async (req: Request, res: Response) => {
+     const result = await optimizerService.runSimulation({
+       ac_setpoint: payload.acTemp,
+       reduction_factor: payload.reductionPercent / 100,
+-      enable_incentives: payload.incentives || false
++      enable_incentives: payload.incentives || false,
++      relative_humidity: payload.relativeHumidity // Passed to optimizer
+     });
+ 
+-    // Async logging (fire and forget)
+     db.insert(simulationLogs).values({
+       user_id: 'demo-user',
+       ac_setpoint: payload.acTemp,
+diff --git a/server/src/services/optimizer.service.ts b/server/src/services/optimizer.service.ts
+index e4a5b50..4e54c46 100644
+--- a/server/src/services/optimizer.service.ts
++++ b/server/src/services/optimizer.service.ts
+@@ -1,10 +1,10 @@
+ import axios from 'axios';
+ 
+-// Interface matching the Python Pydantic model
+ interface SimulationParams {
+   ac_setpoint: number;
+   reduction_factor: number;
+   enable_incentives: boolean;
++  relative_humidity?: number; // Added for Task 7
+ }
+ 
+ interface SimulationResult {
+@@ -19,7 +19,6 @@ export class OptimizerService {
+   private readonly baseUrl: string;
+ 
+   constructor() {
+-    // Docker networking: 'optimizer' is the service name in docker-compose
+     this.baseUrl = process.env.OPTIMIZER_URL || 'http://optimizer:8000';
+   }
+ 
+@@ -41,4 +40,4 @@ export class OptimizerService {
+   }
+ }
+ 
+-export const optimizerService = new OptimizerService();
++export const optimizerService = new OptimizerService();
+\ No newline at end of file
