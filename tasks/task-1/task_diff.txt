@@ -1,0 +1,122 @@
+diff --git a/optimizer/main.py b/optimizer/main.py
+index 20308b3..667609e 100644
+--- a/optimizer/main.py
++++ b/optimizer/main.py
+@@ -1,5 +1,6 @@
+ import logging
+ import os
++from datetime import datetime
+ from fastapi import FastAPI, HTTPException, status
+ from pydantic import BaseModel, Field
+ import numpy as np
+@@ -23,6 +24,7 @@ class SimulationRequest(BaseModel):
+     ac_setpoint: float = Field(..., ge=16.0, le=32.0, description="Target HVAC temperature in Celsius")
+     reduction_factor: float = Field(..., ge=0.0, le=1.0, description="Load shedding percentage (0-1)")
+     enable_incentives: bool = Field(default=False, description="Apply DISCOM demand response rebates")
++    timestamp: str = Field(default=None, description="ISO 8601 timestamp for simulation context")
+ 
+ class SimulationResponse(BaseModel):
+     projected_kwh: float
+@@ -36,8 +38,6 @@ class SimulationResponse(BaseModel):
+ BASE_LOAD_KWH = 28500.0  
+ THERMAL_COEFF = 0.085    # ~8.5% energy delta per degree C (ASHRAE approximation)
+ CARBON_INTENSITY = 0.82  # kgCO2/kWh (Grid India average)
+-PEAK_TARIFF = 12.50      # INR/kWh
+-OFF_PEAK_TARIFF = 8.50   # INR/kWh
+ 
+ @app.get("/health")
+ async def health_check():
+@@ -47,7 +47,29 @@ async def health_check():
+ @app.post("/calculate", response_model=SimulationResponse)
+ async def calculate_impact(payload: SimulationRequest):
+     try:
+-        logger.info(f"Processing simulation for setpoint: {payload.ac_setpoint}C")
++        # --- Time-of-Use (TOU) Logic ---
++        if payload.timestamp:
++            try:
++                dt = datetime.fromisoformat(payload.timestamp)
++                hour = dt.hour
++            except ValueError:
++                # Fallback if format is invalid
++                hour = 12
++        else:
++            hour = 12 # Default to standard noon if missing
++
++        # Apply Dynamic Tariffs based on Time of Day
++        # Peak: 14:00 - 20:00
++        if 14 <= hour < 20:
++            current_tariff = 14.50
++        # Off-Peak: 23:00 - 08:00
++        elif hour >= 23 or hour < 8:
++            current_tariff = 6.50
++        # Standard: Everything else
++        else:
++            current_tariff = 10.00
++            
++        logger.info(f"Processing simulation for setpoint: {payload.ac_setpoint}C at hour {hour} (Rate: {current_tariff})")
+ 
+         # 1. Thermal Load Calculation
+         # Using simplified Degree-Day method. Baseline assumed at 22C.
+@@ -66,9 +88,8 @@ async def calculate_impact(payload: SimulationRequest):
+         final_load = max(0, BASE_LOAD_KWH - total_savings_kwh)
+ 
+         # 3. Financial Modeling
+-        # Blended rate assumption (60% peak / 40% off-peak)
+-        blended_rate = (PEAK_TARIFF * 0.6) + (OFF_PEAK_TARIFF * 0.4)
+-        base_cost = final_load * blended_rate
++        # Using dynamic tariff instead of static blended rate
++        base_cost = final_load * current_tariff
+         
+         dr_rebate = 5000.0 if payload.enable_incentives else 0.0
+         final_cost = max(0, base_cost - dr_rebate)
+diff --git a/server/src/routes/simulation.routes.ts b/server/src/routes/simulation.routes.ts
+index 8e71bb9..683fe4e 100644
+--- a/server/src/routes/simulation.routes.ts
++++ b/server/src/routes/simulation.routes.ts
+@@ -1,6 +1,6 @@
+ import { Router, Request, Response } from 'express';
+ import { optimizerService } from '../services/optimizer.service';
+-import { db } from '../db'; // We will create this next
++import { db } from '../db';
+ import { simulationLogs } from '../db/schema';
+ import { z } from 'zod';
+ 
+@@ -10,7 +10,8 @@ const router = Router();
+ const SimulationSchema = z.object({
+   acTemp: z.number().min(16).max(32),
+   reductionPercent: z.number().min(0).max(100),
+-  incentives: z.boolean().optional()
++  incentives: z.boolean().optional(),
++  simulationTime: z.string().optional() // Added for Task 1
+ });
+ 
+ router.post('/run', async (req: Request, res: Response) => {
+@@ -20,7 +21,8 @@ router.post('/run', async (req: Request, res: Response) => {
+     const result = await optimizerService.runSimulation({
+       ac_setpoint: payload.acTemp,
+       reduction_factor: payload.reductionPercent / 100,
+-      enable_incentives: payload.incentives || false
++      enable_incentives: payload.incentives || false,
++      timestamp: payload.simulationTime // Pass timestamp to optimizer
+     });
+ 
+     // Async logging (fire and forget)
+diff --git a/server/src/services/optimizer.service.ts b/server/src/services/optimizer.service.ts
+index e4a5b50..be97df8 100644
+--- a/server/src/services/optimizer.service.ts
++++ b/server/src/services/optimizer.service.ts
+@@ -5,6 +5,7 @@ interface SimulationParams {
+   ac_setpoint: number;
+   reduction_factor: number;
+   enable_incentives: boolean;
++  timestamp?: string; // Added for Task 1
+ }
+ 
+ interface SimulationResult {
+@@ -41,4 +42,4 @@ export class OptimizerService {
+   }
+ }
+ 
+-export const optimizerService = new OptimizerService();
++export const optimizerService = new OptimizerService();
+\ No newline at end of file
