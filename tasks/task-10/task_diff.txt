@@ -1,0 +1,310 @@
+diff --git a/optimizer/main.py b/optimizer/main.py
+index 20308b3..2519681 100644
+--- a/optimizer/main.py
++++ b/optimizer/main.py
+@@ -1,5 +1,6 @@
+ import logging
+ import os
++from datetime import datetime
+ from fastapi import FastAPI, HTTPException, status
+ from pydantic import BaseModel, Field
+ import numpy as np
+@@ -23,6 +24,19 @@ class SimulationRequest(BaseModel):
+     ac_setpoint: float = Field(..., ge=16.0, le=32.0, description="Target HVAC temperature in Celsius")
+     reduction_factor: float = Field(..., ge=0.0, le=1.0, description="Load shedding percentage (0-1)")
+     enable_incentives: bool = Field(default=False, description="Apply DISCOM demand response rebates")
++    # Cumulative Task Fields (1-10)
++    timestamp: str = Field(default=None, description="ISO 8601 timestamp")
++    grid_carbon_intensity: float = Field(default=0.82, ge=0.0, le=2.0, description="kgCO2/kWh")
++    grid_frequency: float = Field(default=50.0, ge=45.0, le=55.0, description="Grid Frequency in Hz")
++    power_factor: float = Field(default=0.90, ge=0.1, le=1.0, description="Power Factor")
++    grid_voltage: float = Field(default=230.0, ge=150.0, le=300.0, description="Grid Voltage in Volts")
++    battery_capacity: float = Field(default=0.0, ge=0.0, description="Battery Capacity in kWh")
++    current_charge: float = Field(default=0.0, ge=0.0, le=100.0, description="Current Battery Charge %")
++    relative_humidity: float = Field(default=60.0, ge=0.0, le=100.0, description="Relative Humidity %")
++    occupancy_count: int = Field(default=20, ge=0, description="Number of occupants")
++    solar_generation_kw: float = Field(default=0.0, ge=0.0, description="Solar power production")
++    maintenance_mode: bool = Field(default=False, description="Hard shutdown for maintenance")
++    compressor_health: float = Field(default=1.0, ge=0.0, le=1.0, description="Equipment efficiency multiplier")
+ 
+ class SimulationResponse(BaseModel):
+     projected_kwh: float
+@@ -31,73 +45,129 @@ class SimulationResponse(BaseModel):
+     comfort_index: float
+     grid_stability_score: float
+ 
+-# --- Physics Constants (Delhi NCR Region) ---
+-# Baseline assumes a 50,000 sqft commercial facility
++# --- Physics Constants ---
+ BASE_LOAD_KWH = 28500.0  
+-THERMAL_COEFF = 0.085    # ~8.5% energy delta per degree C (ASHRAE approximation)
+-CARBON_INTENSITY = 0.82  # kgCO2/kWh (Grid India average)
+-PEAK_TARIFF = 12.50      # INR/kWh
+-OFF_PEAK_TARIFF = 8.50   # INR/kWh
++THERMAL_COEFF = 0.085    
++PEAK_TARIFF = 12.50      
++OFF_PEAK_TARIFF = 8.50   
+ 
+ @app.get("/health")
+ async def health_check():
+-    """K8s/Docker health probe endpoint."""
+     return {"status": "healthy", "service": "optimizer"}
+ 
+ @app.post("/calculate", response_model=SimulationResponse)
+ async def calculate_impact(payload: SimulationRequest):
+     try:
+-        logger.info(f"Processing simulation for setpoint: {payload.ac_setpoint}C")
++        # 1. Determine Time & Tariff (Task 1)
++        hour = 12
++        if payload.timestamp:
++            try:
++                dt = datetime.fromisoformat(payload.timestamp)
++                hour = dt.hour
++            except ValueError:
++                pass
++        
++        current_tariff = 10.0 # Standard Rate
++        if 14 <= hour < 20:
++            current_tariff = PEAK_TARIFF 
++        elif hour >= 23 or hour < 8:
++            current_tariff = OFF_PEAK_TARIFF
+ 
+-        # 1. Thermal Load Calculation
+-        # Using simplified Degree-Day method. Baseline assumed at 22C.
+-        # Physics: Q = U * A * Delta T
+-        delta_t = max(0, payload.ac_setpoint - 22.0)
++        # 2. Overrides (Safety, Grid, Maintenance)
++        effective_reduction = payload.reduction_factor
++        is_hard_shutdown = payload.maintenance_mode # Task 10
++        is_surge_event = payload.grid_voltage > 255.0 # Task 5
++
++        if is_hard_shutdown or is_surge_event:
++            effective_reduction = 1.0 # Force 100% shutdown
++        elif payload.grid_frequency < 49.8:
++            effective_reduction = 0.50 # Task 3 Emergency
++        elif payload.grid_voltage < 200.0:
++            effective_reduction = max(effective_reduction, 0.5) # Task 5 Brownout
++        elif payload.grid_carbon_intensity > 0.90:
++            effective_reduction = max(effective_reduction, 0.2) # Task 2 Dirty Grid
++
++        # 3. Efficiency (Humidity & Health)
++        effective_coeff = THERMAL_COEFF
++        # Task 7: Humidity Adjustment
++        if payload.relative_humidity > 60.0:
++            penalty = (payload.relative_humidity - 60.0) * 0.01
++            effective_coeff = THERMAL_COEFF / (1.0 + penalty)
+         
+-        # Non-linear savings curve (diminishing returns > 26C)
+-        # Using numpy for efficient calculation
+-        thermal_savings_pct = np.tanh(delta_t * THERMAL_COEFF)
++        # Task 10: Health Adjustment
++        effective_coeff *= payload.compressor_health
++
++        # 4. Thermal & Net Load Calculation
++        delta_t = max(0, payload.ac_setpoint - 22.0)
++        thermal_savings_pct = np.tanh(delta_t * effective_coeff)
+         
+-        # 2. Load Shedding Impact
+-        shedding_savings = BASE_LOAD_KWH * payload.reduction_factor
++        shedding_savings = BASE_LOAD_KWH * effective_reduction
+         thermal_savings = BASE_LOAD_KWH * thermal_savings_pct
+-        
+-        total_savings_kwh = thermal_savings + shedding_savings
+-        final_load = max(0, BASE_LOAD_KWH - total_savings_kwh)
++        building_load = max(0, BASE_LOAD_KWH - (thermal_savings + shedding_savings))
+ 
+-        # 3. Financial Modeling
+-        # Blended rate assumption (60% peak / 40% off-peak)
+-        blended_rate = (PEAK_TARIFF * 0.6) + (OFF_PEAK_TARIFF * 0.4)
+-        base_cost = final_load * blended_rate
++        # Task 6: Battery Arbitrage
++        battery_impact = 0.0
++        if payload.battery_capacity > 0:
++            if current_tariff < 9.0:
++                battery_impact = payload.battery_capacity * 0.5 # Charging
++            elif current_tariff > 12.0:
++                battery_impact = -(payload.battery_capacity * 0.5) # Discharging
+         
+-        dr_rebate = 5000.0 if payload.enable_incentives else 0.0
+-        final_cost = max(0, base_cost - dr_rebate)
++        # Task 9: Solar & Net Load
++        net_load = building_load + battery_impact - payload.solar_generation_kw
++        final_load = net_load
++        
++        # Override for hard safety events
++        if is_hard_shutdown or is_surge_event:
++            final_load = 0.0
++
++        # 5. Financial Modeling (Task 4 & 9)
++        pf_multiplier = 1.0
++        if payload.power_factor < 0.90:
++            pf_multiplier = 1.0 + (0.90 - payload.power_factor)
++        elif payload.power_factor > 0.95:
++            pf_multiplier = 1.0 - ((payload.power_factor - 0.95) * 0.5)
+ 
+-        # 4. Comfort Index Calculation (ASHRAE 55 simplified)
+-        # 1.0 = Perfect, 0.0 = Uninhabitable
++        EXPORT_CREDIT_RATE = 4.50
++        if final_load > 0:
++            base_cost = final_load * current_tariff * pf_multiplier
++        else:
++            base_cost = final_load * EXPORT_CREDIT_RATE # Task 9: Export Credit
++            
++        final_cost = max(0, base_cost - (5000.0 if payload.enable_incentives else 0.0))
++
++        # 6. Comfort Index Calculation (Task 8 & 10)
+         comfort_penalty = 0.0
+-        
++        temp_multiplier = 2.0 if payload.occupancy_count > 50 else 1.0
++        shed_multiplier = 0.5 if payload.occupancy_count < 10 else 1.0
++
+         if payload.ac_setpoint > 24.0:
+-            # Exponential penalty for high temps
+-            comfort_penalty += ((payload.ac_setpoint - 24.0) ** 1.5) * 0.08
+-            
+-        if payload.reduction_factor > 0.15:
+-            # Linear penalty for aggressive shedding
+-            comfort_penalty += (payload.reduction_factor - 0.15) * 2.5
+-            
+-        comfort_score = max(0.1, 1.0 - comfort_penalty)
++            comfort_penalty += ((payload.ac_setpoint - 24.0) ** 1.5) * 0.08 * temp_multiplier
++        if effective_reduction > 0.15:
++            comfort_penalty += (effective_reduction - 0.15) * 2.5 * shed_multiplier
++        
++        # Task 10: Maintenance means building is uninhabitable
++        if is_hard_shutdown:
++            comfort_score = 0.0
++        else:
++            comfort_score = max(0.1, 1.0 - comfort_penalty)
++        
++        # 7. Grid Stability Score (Task 4 & 5)
++        raw_stability = 0.85 + (effective_reduction * 0.15)
++        if is_surge_event:
++            grid_stability_score = 0.0
++        elif payload.power_factor < 0.85:
++            grid_stability_score = min(raw_stability, 0.6)
++        else:
++            grid_stability_score = raw_stability
+ 
+         return {
+             "projected_kwh": round(float(final_load), 2),
+             "cost_estimate": round(float(final_cost), 2),
+-            "carbon_footprint": round(float(final_load * CARBON_INTENSITY), 2),
++            "carbon_footprint": round(float(max(0, final_load) * payload.grid_carbon_intensity), 2),
+             "comfort_index": round(float(comfort_score), 3),
+-            "grid_stability_score": round(0.85 + (payload.reduction_factor * 0.15), 3)
++            "grid_stability_score": round(float(grid_stability_score), 3)
+         }
+-
+     except Exception as e:
+         logger.error(f"Calculation failed: {str(e)}", exc_info=True)
+-        raise HTTPException(
+-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+-            detail="Optimization engine computation error"
+-        )
+\ No newline at end of file
++        raise HTTPException(status_code=500, detail="Optimization engine computation error")
+\ No newline at end of file
+diff --git a/server/src/routes/simulation.routes.ts b/server/src/routes/simulation.routes.ts
+index 8e71bb9..d87d5e2 100644
+--- a/server/src/routes/simulation.routes.ts
++++ b/server/src/routes/simulation.routes.ts
+@@ -1,16 +1,28 @@
+ import { Router, Request, Response } from 'express';
+ import { optimizerService } from '../services/optimizer.service';
+-import { db } from '../db'; // We will create this next
++import { db } from '../db';
+ import { simulationLogs } from '../db/schema';
+ import { z } from 'zod';
+ 
+ const router = Router();
+ 
+-// Validation schema
++// Validation schema with all parameters from Task 1 to Task 10
+ const SimulationSchema = z.object({
+   acTemp: z.number().min(16).max(32),
+   reductionPercent: z.number().min(0).max(100),
+-  incentives: z.boolean().optional()
++  incentives: z.boolean().optional(),
++  simulationTime: z.string().optional(),       // Task 1
++  carbonIntensity: z.number().optional(),      // Task 2
++  gridFreq: z.number().optional(),             // Task 3
++  powerFactor: z.number().min(0.1).max(1.0).optional(), // Task 4
++  gridVoltage: z.number().optional(),          // Task 5
++  batteryCapacity: z.number().min(0).optional(), // Task 6
++  currentCharge: z.number().min(0).max(100).optional(), // Task 6
++  relativeHumidity: z.number().min(0).max(100).optional(), // Task 7
++  occupancyCount: z.number().int().min(0).optional(), // Task 8
++  solarGeneration: z.number().min(0).optional(), // Task 9
++  maintenanceMode: z.boolean().optional(),     // Task 10
++  compressorHealth: z.number().min(0).max(1).optional() // Task 10
+ });
+ 
+ router.post('/run', async (req: Request, res: Response) => {
+@@ -20,10 +32,21 @@ router.post('/run', async (req: Request, res: Response) => {
+     const result = await optimizerService.runSimulation({
+       ac_setpoint: payload.acTemp,
+       reduction_factor: payload.reductionPercent / 100,
+-      enable_incentives: payload.incentives || false
++      enable_incentives: payload.incentives || false,
++      timestamp: payload.simulationTime,
++      grid_carbon_intensity: payload.carbonIntensity,
++      grid_frequency: payload.gridFreq,
++      power_factor: payload.powerFactor,
++      grid_voltage: payload.gridVoltage,
++      battery_capacity: payload.batteryCapacity,
++      current_charge: payload.currentCharge,
++      relative_humidity: payload.relativeHumidity,
++      occupancy_count: payload.occupancyCount,
++      solar_generation_kw: payload.solarGeneration,
++      maintenance_mode: payload.maintenanceMode,
++      compressor_health: payload.compressorHealth
+     });
+ 
+-    // Async logging (fire and forget)
+     db.insert(simulationLogs).values({
+       user_id: 'demo-user',
+       ac_setpoint: payload.acTemp,
+diff --git a/server/src/services/optimizer.service.ts b/server/src/services/optimizer.service.ts
+index e4a5b50..226639c 100644
+--- a/server/src/services/optimizer.service.ts
++++ b/server/src/services/optimizer.service.ts
+@@ -1,10 +1,22 @@
+ import axios from 'axios';
+ 
+-// Interface matching the Python Pydantic model
++// Interface matching the Python Pydantic model with all Task 1-10 fields
+ interface SimulationParams {
+   ac_setpoint: number;
+   reduction_factor: number;
+   enable_incentives: boolean;
++  timestamp?: string;            // Task 1
++  grid_carbon_intensity?: number; // Task 2
++  grid_frequency?: number;       // Task 3
++  power_factor?: number;         // Task 4
++  grid_voltage?: number;         // Task 5
++  battery_capacity?: number;     // Task 6
++  current_charge?: number;       // Task 6
++  relative_humidity?: number;    // Task 7
++  occupancy_count?: number;      // Task 8
++  solar_generation_kw?: number;  // Task 9
++  maintenance_mode?: boolean;    // Task 10
++  compressor_health?: number;    // Task 10
+ }
+ 
+ interface SimulationResult {
+@@ -19,7 +31,6 @@ export class OptimizerService {
+   private readonly baseUrl: string;
+ 
+   constructor() {
+-    // Docker networking: 'optimizer' is the service name in docker-compose
+     this.baseUrl = process.env.OPTIMIZER_URL || 'http://optimizer:8000';
+   }
+ 
+@@ -41,4 +52,4 @@ export class OptimizerService {
+   }
+ }
+ 
+-export const optimizerService = new OptimizerService();
++export const optimizerService = new OptimizerService();
+\ No newline at end of file
